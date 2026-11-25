@@ -1,5 +1,6 @@
 from email.utils import parsedate_to_datetime
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -10,39 +11,53 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 try:
     import requests
     import truststore
     from dotenv import dotenv_values
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
 except ImportError:
     sys.exit("Esqueceu das dependências. Instale com: python -m pip install -r requirements.txt")
 
-CSV_ENTRADA = "entrada/apis.csv"   
-DELIMITADOR = ","                  
-COLUNA_ID = "PAGE_ID"              
-PASTA_SAIDA = "saida"              
-ARQUIVO_ENV = ".env"               
-APENAS_VERIFICAR = False           
-PAGINA_TESTE = ""                  
+
+import pymongo
+
+myclient = pymongo.MongoClient("mongodb://localhost:27017/")
+mydb = myclient["local"]
+mycol = mydb["logs_conflu_automation"]
+
+# mydict = { "name": "John", "address": "Highway 37" }
 
 
-INTERVALO_MINIMO = 3               
-TENTATIVAS = 3                     
-MAX_RETRY_AFTER = 120              
-TIMEOUT = (10, 60)                 
-TAMANHO_MAXIMO_MB = 50             
-CONSULTAS_TAREFA = 10              
-FALHAS_DE_REDE_SEGUIDAS = 3        
+CSV_ENTRADA = "entrada/apis.csv"
+DELIMITADOR = ","
+COLUNA_ID = "PAGE_ID"
+PASTA_SAIDA = "saida"
+ARQUIVO_ENV = ".env"
+APENAS_VERIFICAR = False
+PAGINA_TESTE = ""
+
+
+INTERVALO_MINIMO = 3
+TENTATIVAS = 3
+MAX_RETRY_AFTER = 120
+TIMEOUT = (10, 60)
+TAMANHO_MAXIMO_MB = 50
+CONSULTAS_TAREFA = 10
+FALHAS_DE_REDE_SEGUIDAS = 3
 
 TIPOS = {"API": "", "API-MTD": "", "MS": "MS", "MS-MTD": "MS", "APID": "APID", "APID-MTD": "APID"}
 LIMITE_CAMINHO_WINDOWS = 260
 
 log = logging.getLogger("crawler")
 
-proxima_requisicao = 0.0           
-requisicoes = 0                    
+proxima_requisicao = 0.0
+requisicoes = 0
 
 
 def chave(nome):
@@ -67,8 +82,8 @@ def eh_metodo(texto):
 
 
 def nome_arquivo(texto):
-    texto = re.sub(r"(^|\s)/+", r"\1", texto.strip())       
-    return nome_pasta(re.sub(r"\s*/+\s*", "-", texto))       
+    texto = re.sub(r"(^|\s)/+", r"\1", texto.strip())
+    return nome_pasta(re.sub(r"\s*/+\s*", "-", texto))
 
 
 def destino_pdf(jornada, api, tipo, nome):
@@ -140,8 +155,7 @@ def ler_csv(caminho):
         elif tipo == "API" and not nome_pasta(api):
             linha["motivo"] = "API vazia"
         elif not api:
-            linha["motivo"] = (f"a linha de API anterior (linha {linha_da_api}) é inválida" if linha_da_api
-                               else "nenhuma linha de API antes desta no CSV")
+            linha["motivo"] = (f"a linha de API anterior (linha {linha_da_api}) é inválida" if linha_da_api else "nenhuma linha de API antes desta no CSV")
         else:
             linha.update(situacao="valida", destino=destino_pdf(jornada, api, tipo, nome))
         linhas.append(linha)
@@ -178,6 +192,46 @@ def pdf_integro(caminho):
     except OSError:
         return False
     return inicio == b"%PDF-" and fim.endswith(b"%%EOF")
+
+
+def metadados_pdf(caminho):
+    caminho = Path(caminho)
+    sha256 = hashlib.sha256()
+    with open(caminho, "rb") as arquivo:
+        for bloco in iter(lambda: arquivo.read(64 * 1024), b""):
+            sha256.update(bloco)
+
+    page_count = 0
+    page_title = ""
+    try:
+        reader = PdfReader(str(caminho), strict=False)
+        page_count = len(reader.pages)
+        metadata = reader.metadata
+        if metadata:
+            page_title = str(metadata.title or "").strip()
+        if not page_title and reader.pages:
+            texto = reader.pages[0].extract_text() or ""
+            primeira_linha = next((linha.strip() for linha in texto.splitlines() if linha.strip()), "")
+            page_title = primeira_linha[:500]
+    except (OSError, PdfReadError, ValueError, TypeError, KeyError) as exc:
+        log.warning("Não foi possível extrair metadados de %s: %s", caminho, exc)
+
+    return {
+        "pageTitle": page_title,
+        "pageCount": page_count,
+        "artifact": {
+            "format": "pdf",
+            "sizeBytes": caminho.stat().st_size,
+            "sha256": sha256.hexdigest(),
+        },
+    }
+
+
+def registrar_log_execucao(documento):
+    try:
+        mycol.insert_one(documento)
+    except pymongo.errors.PyMongoError as exc:
+        log.warning("Não foi possível registrar o log no MongoDB: %s", exc)
 
 
 def copiar(origem, destino):
@@ -265,30 +319,61 @@ def liberar_proxima(segundos=None):
     proxima_requisicao = time.monotonic() + (INTERVALO_MINIMO if segundos is None else segundos)
 
 
-def pedir(sessao, url, stream=False):
+def pedir(sessao, url, stream=False, tentativas=None):
     global requisicoes
     problema = ""
     for tentativa in range(1, TENTATIVAS + 1):
         aguardar()
         backoff = INTERVALO_MINIMO * 2 ** (tentativa - 1)
+        inicio_tentativa = time.monotonic()
+        requisicao_iniciada = datetime.now(timezone.utc)
+        numero_tentativa = len(tentativas) + 1 if tentativas is not None else tentativa
         try:
             
             resposta = sessao.get(url, stream=stream, timeout=TIMEOUT, verify=sessao.verify)
         except requests.exceptions.SSLError:
             requisicoes += 1
+            if tentativas is not None:
+                tentativas.append({
+                    "number": numero_tentativa,
+                    "requestedAt": requisicao_iniciada,
+                    "httpStatus": None,
+                    "durationMs": round((time.monotonic() - inicio_tentativa) * 1000),
+                })
             raise
         except requests.TooManyRedirects:
             requisicoes += sessao.max_redirects + 1
             liberar_proxima()
+            if tentativas is not None:
+                tentativas.append({
+                    "number": numero_tentativa,
+                    "requestedAt": requisicao_iniciada,
+                    "httpStatus": None,
+                    "durationMs": round((time.monotonic() - inicio_tentativa) * 1000),
+                })
             raise requests.TooManyRedirects(f"o Confluence redirecionou mais de {sessao.max_redirects} vezes") from None
         except (requests.ConnectionError, requests.Timeout) as exc:
             requisicoes += 1
             problema = "tempo esgotado" if isinstance(exc, requests.Timeout) else "falha de conexão"
             log.debug("Tentativa %s/%s sem resposta: %s", tentativa, TENTATIVAS, exc)
+            if tentativas is not None:
+                tentativas.append({
+                    "number": numero_tentativa,
+                    "requestedAt": requisicao_iniciada,
+                    "httpStatus": None,
+                    "durationMs": round((time.monotonic() - inicio_tentativa) * 1000),
+                })
             liberar_proxima(backoff)
             continue
         requisicoes += 1 + len(resposta.history)
         log.debug("GET %s -> HTTP %s (tentativa %s/%s)", url, resposta.status_code, tentativa, TENTATIVAS)
+        if tentativas is not None:
+            tentativas.append({
+                "number": numero_tentativa,
+                "requestedAt": requisicao_iniciada,
+                "httpStatus": resposta.status_code,
+                "durationMs": round((time.monotonic() - inicio_tentativa) * 1000),
+            })
         if resposta.status_code in (408, 429) or resposta.status_code >= 500:
             espera = segundos_retry_after(resposta)
             limites = {k: v for k, v in resposta.headers.items() if k.lower().startswith(("retry-after", "x-ratelimit"))}
@@ -309,13 +394,13 @@ def eh_login(url):
     return urlsplit(url).path.lower().rstrip("/").endswith(("/login.action", "/dologin.action", "/login.jsp"))
 
 
-def exportar_pdf(sessao, base_url, page_id, destino):
+def exportar_pdf(sessao, base_url, page_id, destino, tentativas=None):
 
     url = f"{base_url}/spaces/flyingpdf/pdfpageexport.action?pageId={page_id}"
-    return salvar_resposta(sessao, base_url, page_id, pedir(sessao, url, stream=True), destino, tarefa=True)
+    return salvar_resposta(sessao, base_url, page_id, pedir(sessao, url, stream=True, tentativas=tentativas), destino, tarefa=True, tentativas=tentativas)
 
 
-def salvar_resposta(sessao, base_url, page_id, resposta, destino, tarefa):
+def salvar_resposta(sessao, base_url, page_id, resposta, destino, tarefa, tentativas=None):
     with resposta:
         if resposta.status_code == 401 or eh_login(resposta.url):
             return "autenticacao", "PAT recusado (HTTP 401 ou tela de login)."
@@ -349,7 +434,7 @@ def salvar_resposta(sessao, base_url, page_id, resposta, destino, tarefa):
                     return "autenticacao", "PAT recusado (o Confluence devolveu a tela de login)."
                 tarefa_id = re.search(r'<meta[^>]+name=["\']ajs-taskid["\'][^>]+content=["\']([\w-]{1,128})["\']', html, re.I)
                 if tarefa and tarefa_id:
-                    return aguardar_tarefa(sessao, base_url, page_id, tarefa_id.group(1), destino)
+                    return aguardar_tarefa(sessao, base_url, page_id, tarefa_id.group(1), destino, tentativas)
                 return "erro", "O Confluence devolveu uma página HTML em vez do PDF."
             if not pdf_integro(temporario):
                 return "erro", "PDF incompleto (download cortado)."
@@ -359,12 +444,12 @@ def salvar_resposta(sessao, base_url, page_id, resposta, destino, tarefa):
             temporario.unlink(missing_ok=True)
 
 
-def aguardar_tarefa(sessao, base_url, page_id, tarefa_id, destino):
+def aguardar_tarefa(sessao, base_url, page_id, tarefa_id, destino, tentativas=None):
     url = f"{base_url}/api/v2/pdfexporttask/progress/{quote(tarefa_id, safe='')}"
     contexto = urlsplit(base_url).path.rstrip("/")
     for consulta in range(CONSULTAS_TAREFA):
         aguardar(min(3 * 2 ** consulta, 30))
-        with pedir(sessao, url) as resposta:
+        with pedir(sessao, url, tentativas=tentativas) as resposta:
             if resposta.status_code == 401 or eh_login(resposta.url):
                 return "autenticacao", "PAT recusado ao consultar a geração do PDF."
             if resposta.status_code != 200:
@@ -382,7 +467,9 @@ def aguardar_tarefa(sessao, base_url, page_id, tarefa_id, destino):
             alvo = urljoin(base_url + "/", resultado)
             if urlsplit(alvo).netloc != urlsplit(base_url).netloc or urlsplit(alvo).scheme != "https":
                 return "erro", "O Confluence indicou um download em outro endereço."
-            return salvar_resposta(sessao, base_url, page_id, pedir(sessao, alvo, stream=True), destino, tarefa=False)
+            return salvar_resposta(sessao, base_url, page_id,
+                                   pedir(sessao, alvo, stream=True, tentativas=tentativas),
+                                   destino, tarefa=False, tentativas=tentativas)
     return "erro", f"O PDF não ficou pronto após {CONSULTAS_TAREFA} consultas."
 
 
@@ -430,7 +517,7 @@ def mostrar_verificacao(linhas):
     log.info("%s linhas, %s páginas a exportar. Nenhuma requisição foi feita.", len(linhas), len(ids))
 
 
-def exportar_csv(sessao, base_url, linhas, pasta, contagem):
+def exportar_csv(sessao, base_url, linhas, pasta, contagem, run_id):
     estado_arquivo = pasta / "estado.json"
     estado = ler_estado(estado_arquivo)
     por_id = {}
@@ -444,6 +531,9 @@ def exportar_csv(sessao, base_url, linhas, pasta, contagem):
     for numero, (page_id, linhas_id) in enumerate(por_id.items(), 1):
         principal = caminho_longo(pasta / linhas_id[0]["destino"])
         rotulo = f"[{numero}/{total}] {linhas_id[0]['tipo']} {page_id}"
+        iniciado_em = time.monotonic()
+        started_at = datetime.now(timezone.utc)
+        tentativas = []
 
         if pdf_integro(principal):
             situacao, mensagem = "existente", ""
@@ -451,7 +541,7 @@ def exportar_csv(sessao, base_url, linhas, pasta, contagem):
             situacao, mensagem = estado[page_id], "resultado de uma execução anterior"
         else:
             try:
-                situacao, mensagem = exportar_pdf(sessao, base_url, page_id, principal)
+                situacao, mensagem = exportar_pdf(sessao, base_url, page_id, principal, tentativas)
                 falhas_de_rede = 0
             except requests.exceptions.SSLError as exc:
                 log.debug("Erro TLS: %s", exc)
@@ -492,6 +582,28 @@ def exportar_csv(sessao, base_url, linhas, pasta, contagem):
                 gravar_estado(estado_arquivo, estado)
             if situacao == "autenticacao":
                 motivo_parada = "O PAT foi recusado. Gere um novo PAT, atualize o .env e rode de novo."
+
+        documento = {
+            "runId": run_id,
+            "pageId": page_id,
+            "pageTitle": "",
+            "status": "downloaded" if situacao == "ok" else ("existing" if situacao == "existente" else situacao),
+            "startedAt": started_at,
+            "finishedAt": datetime.now(timezone.utc),
+            "durationMs": round((time.monotonic() - iniciado_em) * 1000),
+            "destination": linhas_id[0]["destino"],
+            "attempts": tentativas,
+            "inputRows": [linha["numero"] for linha in linhas_id],
+        }
+        if situacao in ("ok", "existente") and pdf_integro(principal):
+            metadados = metadados_pdf(principal)
+            documento["pageTitle"] = metadados["pageTitle"]
+            documento["pageCount"] = metadados["pageCount"]
+            documento["artifact"] = metadados["artifact"]
+        else:
+            documento["error"] = mensagem
+        registrar_log_execucao(documento)
+
         if motivo_parada:
             log.error(motivo_parada)
             break
@@ -502,17 +614,41 @@ def main():
     pasta = Path(PASTA_SAIDA)
     configurar_log(pasta)
     inicio = time.monotonic()
+    run_id = str(uuid.uuid4())
 
     if PAGINA_TESTE:
         base_url, pat, ca_bundle = ler_env()
         destino = caminho_longo(pasta / "teste" / f"{PAGINA_TESTE}.pdf")
+        tentativas = []
+        iniciado_em = time.monotonic()
+        started_at = datetime.now(timezone.utc)
         try:
-            situacao, mensagem = exportar_pdf(criar_sessao(pat, ca_bundle), base_url, PAGINA_TESTE, destino)
+            situacao, mensagem = exportar_pdf(criar_sessao(pat, ca_bundle), base_url, PAGINA_TESTE, destino, tentativas)
         except requests.exceptions.SSLError as exc:
             log.debug("Erro TLS: %s", exc)
             situacao, mensagem = "erro", "certificado TLS recusado: " + explicar_erro_tls(exc)
         except (requests.RequestException, RuntimeError) as exc:
             situacao, mensagem = "erro", str(exc)
+        documento = {
+            "runId": run_id,
+            "pageId": PAGINA_TESTE,
+            "pageTitle": "",
+            "status": "downloaded" if situacao == "ok" else situacao,
+            "startedAt": started_at,
+            "finishedAt": datetime.now(timezone.utc),
+            "durationMs": round((time.monotonic() - iniciado_em) * 1000),
+            "destination": (pasta / "teste" / f"{PAGINA_TESTE}.pdf").as_posix(),
+            "attempts": tentativas,
+            "inputRows": [],
+        }
+        if situacao == "ok" and pdf_integro(destino):
+            metadados = metadados_pdf(destino)
+            documento["pageTitle"] = metadados["pageTitle"]
+            documento["pageCount"] = metadados["pageCount"]
+            documento["artifact"] = metadados["artifact"]
+        else:
+            documento["error"] = mensagem
+        registrar_log_execucao(documento)
         if situacao == "ok":
             log.info("Página %s: PDF salvo em %s", PAGINA_TESTE, pasta / "teste" / f"{PAGINA_TESTE}.pdf")
         else:
@@ -533,20 +669,26 @@ def main():
     base_url, pat, ca_bundle = ler_env()
     contagem = dict.fromkeys(("baixados", "existentes", "copias", "sem_permissao", "nao_encontrada", "erros"), 0)
     try:
-        motivo_parada = exportar_csv(criar_sessao(pat, ca_bundle), base_url, linhas, pasta, contagem)
+        motivo_parada = exportar_csv(criar_sessao(pat, ca_bundle), base_url, linhas, pasta, contagem, run_id)
     except KeyboardInterrupt:
         motivo_parada = "Interrompido pelo usuário. Rode de novo para continuar."
         log.warning(motivo_parada)
 
     minutos = (time.monotonic() - inicio) / 60
+
     ignoradas = sum(linha["situacao"] == "ignorada" for linha in linhas)
+    
     invalidas = sum(linha["situacao"] == "invalida" for linha in linhas)
-    log.info("=== Fim em %.1f min: %s baixados, %s já existiam, %s cópias locais, %s sem permissão, "
-             "%s não encontrados, %s com erro | %s linhas ALLOWED=FALSE, %s inválidas | %s requisições HTTP.",
-             minutos, contagem["baixados"], contagem["existentes"], contagem["copias"],
-             contagem["sem_permissao"], contagem["nao_encontrada"], contagem["erros"],
-             ignoradas, invalidas, requisicoes)
+    
+    log.info(
+            "=== Fim em %.1f min: %s baixados, %s já existiam, %s cópias locais, %s sem permissão, "
+            "%s não encontrados, %s com erro | %s linhas ALLOWED=FALSE, %s inválidas | %s requisições HTTP.",
+            minutos, contagem["baixados"], contagem["existentes"], contagem["copias"],
+            contagem["sem_permissao"], contagem["nao_encontrada"], contagem["erros"],
+            ignoradas, invalidas, requisicoes)
+    
     falhou = motivo_parada or invalidas or contagem["sem_permissao"] or contagem["nao_encontrada"] or contagem["erros"]
+    
     return 1 if falhou else 0
 
 
